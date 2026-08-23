@@ -8,11 +8,23 @@ One Python script. Zero pip dependencies (stdlib only, Python 3.8+). Built to ru
 
 Any single search engine has blind spots — niche sources, deep-web pages, semantically-related-but-different phrasing. This tool fans one query out to three engines simultaneously, then cross-confirms results: a URL returned by multiple engines is almost always the authoritative source.
 
-```
-        ┌──> Firecrawl (self-hosted or cloud) ────────┐
-Query ──┤──> Exa (neural + keyword, type=auto) ───────┼──> Dedupe ──> Score ──> Rank ──> Output
-        └──> Tavily (LLM-tuned, +synthesized answer) ┘
-              (ThreadPoolExecutor, max_workers=3, per-engine retry ×2)
+```mermaid
+flowchart LR
+    Q[Query] --> FC["Firecrawl<br/>(self-hosted or cloud)"]
+    Q --> EX["Exa<br/>(neural + keyword, type=auto)"]
+    Q --> TV["Tavily<br/>(LLM-tuned, +synthesized answer)"]
+    FC --> DD[Dedupe<br/>URL normalization + docs-alias collapsing]
+    EX --> DD
+    TV --> DD
+    DD --> SC[Score<br/>agreement + domain + recency + position]
+    SC --> RK[Rank]
+    RK --> OUT["Output (text / --json)"]
+    RK -. "research query?" .-> WK[("LLM Wiki<br/>queries/ archive")]
+    subgraph parallel ["ThreadPoolExecutor (max_workers=3, retry ×2)"]
+        FC
+        EX
+        TV
+    end
 ```
 
 ## Quick Start
@@ -90,6 +102,7 @@ URLs are normalized (lowercase netloc, trailing slash stripped, query/fragment i
   "answer": "Tavily synthesized one-line answer",
   "raw": 24, "deduped": 18,
   "errors": [],
+  "archived_to_wiki": null,
   "results": [
     {"url": "...", "title": "...", "snippet": "...",
      "engine": "exa", "rank": 0, "date": "2026-03-17",
