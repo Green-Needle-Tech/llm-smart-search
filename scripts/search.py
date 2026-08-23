@@ -29,9 +29,23 @@ from urllib.parse import urlparse, urlunparse
 
 # --- Built-in env loader (robust: quotes, 'export ' prefix, inline comments) ---
 def load_env():
-    env_path = os.path.expanduser("~/.hermes/.env")
-    if not os.path.exists(env_path):
+    candidates = [
+        os.path.expanduser("~/.hermes/.env"),
+        "/root/.hermes/.env",  # fallback: sandboxed shells may override HOME
+    ]
+    existing = [p for p in candidates if os.path.exists(p)]
+    if not existing:
         raise RuntimeError("~/.hermes/.env not found — cannot load API keys")
+    # Prefer a file that actually defines search-engine keys (a sandboxed HOME
+    # may hold a stub .env with only model keys).
+    def has_search_keys(path):
+        try:
+            with open(path) as f:
+                return any(l.startswith(("EXA_API_KEY=", "TAVILY_API_KEY=", "FIRECRAWL_API_KEY="))
+                           for l in f)
+        except OSError:
+            return False
+    env_path = next((p for p in existing if has_search_keys(p)), existing[0])
     with open(env_path) as f:
         for line in f:
             line = line.strip()
