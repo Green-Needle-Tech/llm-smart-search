@@ -75,7 +75,15 @@ load_env()
 ARGS = [a for a in sys.argv[1:] if not a.startswith("--")]
 JSON_OUT = "--json" in sys.argv
 QUERY = ARGS[0] if ARGS else ""
-MAX_RESULTS = int(ARGS[1]) if len(ARGS) > 1 else 10
+try:
+    MAX_RESULTS = int(ARGS[1]) if len(ARGS) > 1 else 10
+    if not (1 <= MAX_RESULTS <= 50):
+        raise ValueError
+except ValueError:
+    print(f"error: MAX_RESULTS must be an integer between 1 and 50, got {ARGS[1]!r}\n"
+          "usage: search.py QUERY [MAX_RESULTS] [--json] [--no-wiki] [--wiki] [--arxiv] [--no-arxiv]",
+          file=sys.stderr)
+    sys.exit(2)
 if not QUERY:
     print("usage: search.py QUERY [MAX_RESULTS] [--json] [--no-wiki] [--wiki] [--arxiv] [--no-arxiv]"); sys.exit(2)
 
