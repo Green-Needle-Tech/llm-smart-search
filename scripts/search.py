@@ -5,6 +5,13 @@ Usage:
   python3 search.py "query" [max_results] [--json]
   python3 search.py "query" [max_results] --json        # machine-readable output
 
+Research archiving:
+  Queries containing "research" or "deep research" (case-insensitive) are
+  automatically archived to the LLM Wiki (Karpathy-style) under WIKI_PATH
+  (default ~/wiki) in queries/ — with frontmatter, index.md entry, and
+  log.md append. Normal searches are NOT archived. Override with
+  --no-wiki (never archive) or --wiki (always archive).
+
 v2.0.0 improvements over v1:
   - Tavily: uses `include_answer` for a synthesized answer + returns published dates
   - Exa: uses neural/keyword auto mode + returns published dates
@@ -47,7 +54,19 @@ JSON_OUT = "--json" in sys.argv
 QUERY = ARGS[0] if ARGS else ""
 MAX_RESULTS = int(ARGS[1]) if len(ARGS) > 1 else 10
 if not QUERY:
-    print("usage: search.py QUERY [MAX_RESULTS] [--json]"); sys.exit(2)
+    print("usage: search.py QUERY [MAX_RESULTS] [--json] [--no-wiki] [--wiki]"); sys.exit(2)
+
+# --- Research detection: archive to LLM Wiki only for research queries ---
+import re as _re
+def is_research_query(q):
+    return bool(_re.search(r"\b(deep\s+)?research(es|ing)?\b", q, _re.I))
+
+if "--no-wiki" in sys.argv:
+    ARCHIVE_TO_WIKI = False
+elif "--wiki" in sys.argv:
+    ARCHIVE_TO_WIKI = True
+else:
+    ARCHIVE_TO_WIKI = is_research_query(QUERY)
 
 # --- Domain quality tiers (higher = more authoritative) ---
 HIGH_QUALITY_DOMAINS = {
@@ -261,6 +280,95 @@ for key, r in merged.items():
 
 ranked = sorted(merged.values(), key=lambda x: -x["score"])[:MAX_RESULTS]
 
+# --- Archive research results to the LLM Wiki (research queries only) ---
+def slugify(text, max_len=60):
+    s = _re.sub(r"[^a-z0-9\s-]", "", text.lower()).strip()
+    s = _re.sub(r"[\s_-]+", "-", s)
+    return (s[:max_len].rstrip("-")) or "research-query"
+
+def archive_to_wiki(query, results, answer, engine_errors):
+    """File the research result as a wiki page under WIKI_PATH/queries/.
+
+    Follows the Karpathy LLM Wiki conventions: frontmatter, index.md entry,
+    log.md append. Best-effort — archive failures never break the search.
+    Returns the created file path, or None on failure/skip.
+    """
+    if not results:
+        return None
+    try:
+        import datetime, hashlib
+        wiki = os.environ.get("WIKI_PATH", os.path.expanduser("~/wiki"))
+        qdir = os.path.join(wiki, "queries")
+        os.makedirs(qdir, exist_ok=True)
+        today = datetime.date.today().isoformat()
+        slug = slugify(query)
+        path = os.path.join(qdir, f"{slug}.md")
+        n = 1
+        while os.path.exists(path):  # don't clobber earlier research runs
+            n += 1
+            path = os.path.join(qdir, f"{slug}-{n}.md")
+        sources = [r["url"] for r in results if r.get("url")]
+        lines = [
+            "---",
+            f"title: 'Research: {query[:100]}'",
+            f"created: {today}",
+            f"updated: {today}",
+            "type: query",
+            "tags: [research, web-search]",
+            f"sources: {json.dumps(sources[:10])}",
+            "---",
+            "",
+            f"# Research: {query}",
+            "",
+            f"*Auto-archived by llm-smart-search on {today} "
+            f"(firecrawl + exa + tavily, {len(results)} ranked results).*",
+            "",
+        ]
+        if answer:
+            lines += ["## Synthesized answer", "", answer, ""]
+        lines += ["## Top results", ""]
+        for i, r in enumerate(results, 1):
+            lines.append(f"{i}. **[{r['title']}]({r['url']})** — score {r['score']}, "
+                         f"engines: {', '.join(sorted(set(r['engines'])))}"
+                         + (f", {r['date'][:10]}" if r.get("date") else ""))
+            if r.get("snippet"):
+                lines.append(f"   > {r['snippet'][:250]}")
+        if engine_errors:
+            lines += ["", f"*Engine errors: {'; '.join(engine_errors)}*"]
+        with open(path, "w", encoding="utf-8") as f:
+            f.write("\n".join(lines) + "\n")
+        # index.md entry (append under ## Queries, or create header)
+        idx = os.path.join(wiki, "index.md")
+        entry = f"- [[{os.path.splitext(os.path.basename(path))[0]}]] — {query[:80]}"
+        if os.path.exists(idx):
+            with open(idx, encoding="utf-8") as f:
+                content = f.read()
+            if "## Queries" in content:
+                head, _, tail = content.rpartition("## Queries")
+                # insert before next section header or at end
+                nxt = _re.search(r"\n## ", tail)
+                insert_at = nxt.start() if nxt else len(tail)
+                tail = tail[:insert_at].rstrip("\n") + "\n" + entry + "\n" + tail[insert_at:]
+                content = head + "## Queries" + tail
+            else:
+                content = content.rstrip("\n") + "\n\n## Queries\n\n" + entry + "\n"
+            with open(idx, "w", encoding="utf-8") as f:
+                f.write(content)
+        else:
+            with open(idx, "w", encoding="utf-8") as f:
+                f.write(f"# Wiki Index\n\n## Queries\n\n{entry}\n")
+        # log.md append
+        log = os.path.join(wiki, "log.md")
+        with open(log, "a", encoding="utf-8") as f:
+            f.write(f"\n## [{today}] ingest | llm-smart-search: {query[:80]}\n"
+                    f"- Archived {len(results)} ranked results to queries/{os.path.basename(path)}\n")
+        return path
+    except Exception as e:
+        print(f"wiki-archive: skipped ({e})", file=sys.stderr)
+        return None
+
+wiki_path = archive_to_wiki(QUERY, ranked, tavily_answer, errors) if ARCHIVE_TO_WIKI else None
+
 # --- Output ---
 if JSON_OUT:
     print(json.dumps({
@@ -270,6 +378,7 @@ if JSON_OUT:
         "raw": len(all_results),
         "deduped": len(merged),
         "errors": errors,
+        "archived_to_wiki": wiki_path,
         "results": ranked,
     }, ensure_ascii=False, indent=2))
     sys.exit(0)
@@ -277,6 +386,8 @@ if JSON_OUT:
 print(f"Query: {QUERY}")
 print("Engines: firecrawl, exa, tavily")
 print(f"Raw: {len(all_results)} | Deduped: {len(merged)} | Top: {len(ranked)}")
+if ARCHIVE_TO_WIKI:
+    print(f"Wiki: {'archived -> ' + wiki_path if wiki_path else 'archive skipped (no results or error)'}")
 if errors:
     print(f"Errors: {', '.join(errors)}")
 if tavily_answer:

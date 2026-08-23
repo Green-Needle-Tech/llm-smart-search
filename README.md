@@ -25,6 +25,29 @@ python3 scripts/search.py "query" [max_results]
 python3 scripts/search.py "query" 10 --json
 ```
 
+## Research Archiving (LLM Wiki)
+
+Queries containing **"research"** or **"deep research"** (case-insensitive, word-boundary matched) are automatically archived to a [Karpathy-style LLM Wiki](https://gist.github.com/karpathy/442a6bf555914893e9891c11519de94f) — normal searches are never archived.
+
+- **Location:** `WIKI_PATH` env var (default `~/wiki`)
+- **What's written:** a page under `queries/` with YAML frontmatter (title, dates, type, tags, source URLs), the synthesized answer, and all ranked results with scores/engine agreement; plus an `index.md` entry and a `log.md` append
+- **No clobbering:** repeat runs of the same query create `slug-2.md`, `slug-3.md`, …
+- **Best-effort:** wiki write failures print a warning to stderr and never break search output
+- **JSON mode:** adds an `archived_to_wiki` field (file path or `null`)
+- **Overrides:** `--wiki` forces archiving, `--no-wiki` disables it
+
+```bash
+# Archived (contains "research")
+python3 scripts/search.py "deep research on LLM routing strategies" 10
+
+# NOT archived (normal query)
+python3 scripts/search.py "best pizza in rome" 5
+
+# Force / disable
+python3 scripts/search.py "LLM routing" 5 --wiki
+python3 scripts/search.py "research notes query" 5 --no-wiki
+```
+
 ### API keys
 
 Set these in your environment or `~/.hermes/.env` (the script's built-in env loader reads it automatically):
