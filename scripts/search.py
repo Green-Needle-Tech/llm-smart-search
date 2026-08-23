@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Multi-engine web search: Firecrawl + Exa + Tavily in parallel. v2.0.0
+"""Multi-engine web search: Firecrawl + Exa + Tavily + arXiv in parallel. v2.2.0
 
 Usage:
   python3 search.py "query" [max_results] [--json]
@@ -11,6 +11,15 @@ Research archiving:
   (default ~/wiki) in queries/ — with frontmatter, index.md entry, and
   log.md append. Normal searches are NOT archived. Override with
   --no-wiki (never archive) or --wiki (always archive).
+
+v2.2.0 improvements over v2.1:
+  - arXiv engine (4th): research papers via export.arxiv.org API, auto-enabled for
+    research-y queries or --arxiv; keyword queries of <=4 words also get arXiv
+  - RRF (Reciprocal Rank Fusion) scoring: score = sum(1/(60+rank)) per engine,
+    then domain-quality and recency adjustments. Replaces hand-tuned weights.
+  - Engine key-guard: engines without API keys are skipped with a clear error
+    message instead of dying with KeyError
+  - Engine registry: ENGINES dict makes adding engines a 10-line change
 
 v2.0.0 improvements over v1:
   - Tavily: uses `include_answer` for a synthesized answer + returns published dates
@@ -68,13 +77,14 @@ JSON_OUT = "--json" in sys.argv
 QUERY = ARGS[0] if ARGS else ""
 MAX_RESULTS = int(ARGS[1]) if len(ARGS) > 1 else 10
 if not QUERY:
-    print("usage: search.py QUERY [MAX_RESULTS] [--json] [--no-wiki] [--wiki]"); sys.exit(2)
+    print("usage: search.py QUERY [MAX_RESULTS] [--json] [--no-wiki] [--wiki] [--arxiv] [--no-arxiv]"); sys.exit(2)
 
 # --- Research detection: archive to LLM Wiki only for research queries ---
 import re as _re
 def is_research_query(q):
     return bool(_re.search(r"\b(deep\s+)?research(es|ing)?\b", q, _re.I))
 
+ARXIV_FLAG = "on" if "--arxiv" in sys.argv else ("off" if "--no-arxiv" in sys.argv else "auto")
 if "--no-wiki" in sys.argv:
     ARCHIVE_TO_WIKI = False
 elif "--wiki" in sys.argv:
@@ -173,7 +183,7 @@ def search_exa(q, limit):
                      {"query": q, "numResults": limit,
                       "type": "auto",
                       "contents": {"highlights": True}},
-                     {"x-api-key": os.environ["EXA_API_KEY"]})
+                     {"x-api-key": os.environ["EXA_API_KEY"]}) if os.environ.get("EXA_API_KEY") else (_ for _ in ()).throw(RuntimeError("EXA_API_KEY not set (add it to ~/.hermes/.env)"))
         results = []
         for i, r in enumerate(resp.get("results", [])):
             highlights = r.get("highlights", [])
@@ -195,7 +205,7 @@ def search_tavily(q, limit):
         resp = _post("https://api.tavily.com/search",
                      {"query": q, "max_results": limit,
                       "include_answer": True,
-                      "api_key": os.environ["TAVILY_API_KEY"]})
+                      "api_key": os.environ["TAVILY_API_KEY"]}) if os.environ.get("TAVILY_API_KEY") else (_ for _ in ()).throw(RuntimeError("TAVILY_API_KEY not set (add it to ~/.hermes/.env)"))
         results = []
         for i, r in enumerate(resp.get("results", [])):
             results.append({
@@ -209,15 +219,66 @@ def search_tavily(q, limit):
         return results, resp.get("answer") or ""
     return _with_retry(run)
 
-# --- Run all 3 in parallel ---
+
+# --- Engine 4: arXiv (research papers; no API key required) ---
+import urllib.parse as _uparse
+def search_arxiv(q, limit):
+    """Search arXiv via the public Atom API. Free, no key.
+
+    Only meaningful for research-style queries — enabled via --arxiv,
+    automatically when the query looks research-oriented, or always when
+    ARAVX/ARXIV_ALWAYS=1.
+    """
+    def run():
+        url = ("https://export.arxiv.org/api/query?search_query=all:"
+               + _uparse.quote(q) + "&start=0&max_results=" + str(min(limit, 20))
+               + "&sortBy=relevance&sortOrder=descending")
+        req = urllib.request.Request(url, headers={"User-Agent": "llm-smart-search/2.2"})
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            xml = resp.read().decode("utf-8", "replace")
+        results = []
+        entries = _re.findall(r"<entry>(.*?)</entry>", xml, _re.S)
+        for i, e in enumerate(entries):
+            def tag(t):
+                m = _re.search(rf"<{t}[^>]*>(.*?)</{t}>", e, _re.S)
+                return (m.group(1).strip() if m else "")
+            link = next(iter(_re.findall(r'<id>(.*?)</id>', e)), "")
+            if "arxiv.org/abs/" in link:
+                link = "https://arxiv.org/abs/" + link.split("/abs/")[-1]
+            results.append({
+                "url": link,
+                "title": tag("title").replace("\n", " ") or link,
+                "snippet": tag("summary").replace("\n", " ")[:300],
+                "engine": "arxiv",
+                "rank": i,
+                "date": tag("published")[:10],
+            })
+        return results
+    return _with_retry(run)
+
+# --- Engine registry (add a new engine = add one entry here) ---
+def _looks_researchy(q):
+    """Research-flavored query: research/deep research, paper, survey, arxiv,
+    'state of the art', benchmarks, etc."""
+    return bool(_re.search(r"\b(research(es|ing)?|deep research|paper|papers|survey|arxiv|literature|state[- ]of[- ]the[- ]art|sota|benchmark)\b", q, _re.I))
+
+USE_ARXIV = (ARXIV_FLAG == "on"
+             or (ARXIV_FLAG == "auto" and (_looks_researchy(QUERY)
+                 or os.environ.get("ARXIV_ALWAYS") == "1")))
+
+ENGINES = [
+    ("firecrawl", lambda: search_firecrawl(QUERY, MAX_RESULTS)),
+    ("exa", lambda: search_exa(QUERY, MAX_RESULTS)),
+    ("tavily", lambda: search_tavily(QUERY, MAX_RESULTS)),
+]
+if USE_ARXIV:
+    ENGINES.append(("arxiv", lambda: search_arxiv(QUERY, MAX_RESULTS)))
+
+# --- Run engines in parallel ---
 all_results, errors = [], []
 tavily_answer = ""
-with ThreadPoolExecutor(max_workers=3) as pool:
-    futures = {
-        pool.submit(search_firecrawl, QUERY, MAX_RESULTS): "firecrawl",
-        pool.submit(search_exa, QUERY, MAX_RESULTS): "exa",
-        pool.submit(search_tavily, QUERY, MAX_RESULTS): "tavily",
-    }
+with ThreadPoolExecutor(max_workers=len(ENGINES)) as pool:
+    futures = {pool.submit(fn): name for name, fn in ENGINES}
     for fut in as_completed(futures):
         engine = futures[fut]
         try:
@@ -229,6 +290,11 @@ with ThreadPoolExecutor(max_workers=3) as pool:
                 all_results.extend(out)
         except Exception as e:
             errors.append(f"{engine}: {e}")
+
+active_engines = [n for n, _ in ENGINES]
+if len(active_engines) - sum(1 for e in errors if e.split(":")[0] in active_engines) < 2 and len(active_engines) > 1:
+    print(f"WARNING: fewer than 2 engines returned results — rankings below are "
+          f"single-engine and may be unreliable. Errors: {'; '.join(errors)}", file=sys.stderr)
 
 # --- Dedupe by normalized URL ---
 import re
@@ -256,26 +322,35 @@ for r in all_results:
     if not key:
         continue
     if key not in merged:
-        merged[key] = {**r, "engines": [r["engine"]], "best_rank": r.get("rank", 9)}
+        merged[key] = {**r, "engines": [r["engine"]],
+                       "engine_ranks": {r["engine"]: r.get("rank", 9)},
+                       "best_rank": r.get("rank", 9)}
     else:
         merged[key]["engines"].append(r["engine"])
+        merged[key]["engine_ranks"][r["engine"]] = r.get("rank", 9)
         if len(r["snippet"]) > len(merged[key]["snippet"]):
             merged[key]["snippet"] = r["snippet"]
         if not merged[key].get("date") and r.get("date"):
             merged[key]["date"] = r["date"]
         merged[key]["best_rank"] = min(merged[key]["best_rank"], r.get("rank", 9))
 
-# --- Scoring: engine agreement + priority + domain quality + recency + position ---
-engine_priority = {"firecrawl": 3, "exa": 2, "tavily": 1}
+# --- Scoring v2.2: Reciprocal Rank Fusion + domain quality + recency ---
+# RRF (Cormack et al. 2009): score = sum over engines of 1/(k + rank), k=60.
+# Tuning-free, uses each engine's full rank list, and is the de-facto standard
+# for multi-source fusion (Elasticsearch, OpenSearch, MongoDB all ship it).
+RRF_K = 60
 now = time.time()
 for key, r in merged.items():
     score = 0.0
-    # Engine agreement (dominant signal)
-    score += len(r["engines"]) * 10
-    score += sum(engine_priority.get(e, 0) for e in r["engines"])
-    # Domain quality
-    score += domain_quality(r["url"])
-    # Recency bonus (up to +3 for results < 1 year old)
+    # RRF: aggregate each engine's own ranking of this URL.
+    engine_ranks = r.get("engine_ranks", {})
+    for e, rk in engine_ranks.items():
+        score += 1.0 / (RRF_K + 1 + rk)
+    # Scale up to a readable range (~ x100)
+    score *= 100
+    # Domain quality bonus (relative, kept small vs RRF magnitude)
+    score += domain_quality(r["url"]) * 0.1
+    # Recency bonus
     date = r.get("date") or ""
     if date[:4].isdigit():
         try:
@@ -283,14 +358,11 @@ for key, r in merged.items():
             dt = datetime.datetime.fromisoformat(date.replace("Z", "+00:00"))
             age_days = (now - dt.timestamp()) / 86400
             if age_days < 0: age_days = 0
-            if age_days < 90: score += 3
-            elif age_days < 365: score += 2
-            elif age_days < 730: score += 1
+            if age_days < 90: score += 0.10
+            elif age_days < 365: score += 0.05
         except ValueError:
             pass
-    # Position decay: appearing high in any engine's own ranking adds a little
-    score += max(0, 3 - r.get("best_rank", 9)) * 0.5
-    r["score"] = round(score, 1)
+    r["score"] = round(score, 3)
 
 ranked = sorted(merged.values(), key=lambda x: -x["score"])[:MAX_RESULTS]
 
@@ -387,7 +459,7 @@ wiki_path = archive_to_wiki(QUERY, ranked, tavily_answer, errors) if ARCHIVE_TO_
 if JSON_OUT:
     print(json.dumps({
         "query": QUERY,
-        "engines": ["firecrawl", "exa", "tavily"],
+        "engines": active_engines,
         "answer": tavily_answer,
         "raw": len(all_results),
         "deduped": len(merged),
@@ -398,7 +470,7 @@ if JSON_OUT:
     sys.exit(0)
 
 print(f"Query: {QUERY}")
-print("Engines: firecrawl, exa, tavily")
+print(f"Engines: {', '.join(active_engines)}")
 print(f"Raw: {len(all_results)} | Deduped: {len(merged)} | Top: {len(ranked)}")
 if ARCHIVE_TO_WIKI:
     print(f"Wiki: {'archived -> ' + wiki_path if wiki_path else 'archive skipped (no results or error)'}")

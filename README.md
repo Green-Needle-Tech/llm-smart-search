@@ -1,6 +1,6 @@
 # LLM Smart Search
 
-Multi-engine web search for AI agents and RAG pipelines — **Firecrawl + Exa + Tavily in parallel, merged, scored, and ranked**, with a synthesized one-line answer on top.
+Multi-engine web search for AI agents and RAG pipelines — **Firecrawl + Exa + Tavily + arXiv in parallel, merged via Reciprocal Rank Fusion (RRF), scored, and ranked**, with a synthesized one-line answer on top.
 
 One Python script. Zero pip dependencies (stdlib only, Python 3.8+). Built to run inside [Hermes Agent](https://hermes-agent.nousresearch.com) sessions, cron jobs, or any pipeline where a single search engine misses too much.
 
@@ -98,7 +98,7 @@ URLs are normalized (lowercase netloc, trailing slash stripped, query/fragment i
 ```json
 {
   "query": "...",
-  "engines": ["firecrawl", "exa", "tavily"],
+  "engines": ["firecrawl", "exa", "tavily", "arxiv"],
   "answer": "Tavily synthesized one-line answer",
   "raw": 24, "deduped": 18,
   "errors": [],
