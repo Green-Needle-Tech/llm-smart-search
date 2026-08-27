@@ -1,21 +1,26 @@
 #!/usr/bin/env python3
-"""Multi-engine web search: Firecrawl + Exa + Brave + arXiv in parallel. v2.3.0
+"""Multi-engine web search: Firecrawl + Exa + Brave + arXiv in parallel. v2.4.0
 
 Usage:
   python3 search.py "query" [max_results] [--json]
   python3 search.py "query" [max_results] --json        # machine-readable output
 
-Research archiving:
+Research archiving & Memory Architecture:
   Queries containing "research" or "deep research" (case-insensitive) are
-  automatically archived to the LLM Wiki (Karpathy-style) under WIKI_PATH
+  automatically archived to the LLM Wiki (Karpathy-style, L3) under WIKI_PATH
   (default ~/wiki) in queries/ — with frontmatter, index.md entry, and
-  log.md append. Normal searches are NOT archived. Override with
+  log.md append. Additionally, a relevant pointer is retained in Hindsight (L2)
+  tagged 'wiki-ref' for fast semantic and temporal retrieval.
+  Normal searches are NOT archived. Override with
   --no-wiki (never archive) or --wiki (always archive).
 
-v2.3.0 changes over v2.2:
-  - Tavily replaced by Brave Search API (api.search.brave.com, X-Subscription-Token)
-    as the third web engine; Brave returns published dates via page_age
-  - Engine key-guard now checks BRAVE_SEARCH_API_KEY instead of TAVILY_API_KEY
+v2.4.0 improvements over v2.3:
+  - L2 Hindsight pointer retention: when research queries are archived to L3 LLM Wiki,
+    a pointer episode is automatically retained in Hindsight memory (bank: main,
+    tags: wiki-ref, research, web-search) containing the query, wiki relative path,
+    key domains, and top sources.
+  - Configurable via HINDSIGHT_API_URL, HINDSIGHT_BANK_ID, HINDSIGHT_API_KEY, and
+    HINDSIGHT_AUTO_RETAIN env vars. Best-effort and non-blocking.
 v2.2.0 improvements over v2.1:
   - arXiv engine (4th): research papers via export.arxiv.org API, auto-enabled for
     research-y queries or --arxiv; keyword queries of <=4 words also get arXiv
@@ -389,17 +394,57 @@ for key, r in merged.items():
 
 ranked = sorted(merged.values(), key=lambda x: -x["score"])[:MAX_RESULTS]
 
-# --- Archive research results to the LLM Wiki (research queries only) ---
+# --- Research archiving: L3 LLM Wiki + L2 Hindsight pointer ---
 def slugify(text, max_len=60):
     s = _re.sub(r"[^a-z0-9\s-]", "", text.lower()).strip()
     s = _re.sub(r"[\s_-]+", "-", s)
     return (s[:max_len].rstrip("-")) or "research-query"
 
+def retain_to_hindsight(query, wiki_rel_path, results, today):
+    """Store an L2 pointer in Hindsight pointing to the L3 wiki page.
+
+    Follows the 3-layer memory architecture: Hindsight (L2) holds the pointer
+    (tagged wiki-ref) for semantic/temporal recall; full search results live in
+    the LLM Wiki (L3). Best-effort — failure prints to stderr and never breaks search.
+    """
+    if os.environ.get("HINDSIGHT_AUTO_RETAIN", "1") in ("0", "false", "no"):
+        return False
+    base_url = os.environ.get("HINDSIGHT_API_URL", "http://localhost:8888").rstrip("/")
+    bank_id = os.environ.get("HINDSIGHT_BANK_ID", "main")
+    api_key = os.environ.get("HINDSIGHT_API_KEY", "")
+
+    # Top sources & domains
+    sources = [r["url"] for r in results[:5] if r.get("url")]
+    domains = list(dict.fromkeys(urlparse(u).netloc for u in sources if urlparse(u).netloc))
+
+    content = (
+        f"Research query '{query}' was searched via llm-smart-search on {today} and archived to wiki at {wiki_rel_path}. "
+        f"Top domains: {', '.join(domains[:5])}. Key sources: {', '.join(sources[:3])}."
+    )
+    payload = {
+        "items": [{
+            "content": content,
+            "context": f"llm-smart-search research query: {query[:100]}",
+            "tags": ["wiki-ref", "research", "web-search"]
+        }]
+    }
+    url = f"{base_url}/v1/default/banks/{bank_id}/memories"
+    headers = {}
+    if api_key:
+        headers["Authorization"] = f"Bearer {api_key}"
+    try:
+        _post(url, payload, headers=headers, timeout=10)
+        return True
+    except Exception as e:
+        print(f"hindsight-retain: skipped ({e})", file=sys.stderr)
+        return False
+
 def archive_to_wiki(query, results, answer, engine_errors):
     """File the research result as a wiki page under WIKI_PATH/queries/.
 
     Follows the Karpathy LLM Wiki conventions: frontmatter, index.md entry,
-    log.md append. Best-effort — archive failures never break the search.
+    log.md append, plus an L2 pointer retained in Hindsight.
+    Best-effort — archive failures never break the search.
     Returns the created file path, or None on failure/skip.
     """
     if not results:
@@ -471,6 +516,11 @@ def archive_to_wiki(query, results, answer, engine_errors):
         with open(log, "a", encoding="utf-8") as f:
             f.write(f"\n## [{today}] ingest | llm-smart-search: {query[:80]}\n"
                     f"- Archived {len(results)} ranked results to queries/{os.path.basename(path)}\n")
+
+        # Retain L2 pointer in Hindsight
+        rel_wiki_path = f"queries/{os.path.basename(path)}"
+        retain_to_hindsight(query, rel_wiki_path, results, today)
+
         return path
     except Exception as e:
         print(f"wiki-archive: skipped ({e})", file=sys.stderr)

@@ -30,11 +30,13 @@ flowchart LR
     DD --> RRF["RRF Score<br/>Σ 1/(60+rank) × 100<br/>+ domain + recency"]
     RRF --> RK[Rank]
     RK --> OUT["Output (text / --json)"]
-    RK -. "research query? (wiki trigger)" .-> WK[("LLM Wiki<br/>queries/ archive")]
+    RK -. "research query? (wiki trigger)" .-> WK[("L3 LLM Wiki<br/>queries/ archive")]
+    WK -. "pointer retain (wiki-ref)" .-> HS[("L2 Hindsight<br/>semantic & temporal index")]
 ```
 
-**v2.3.0 highlights**
+**v2.4.0 highlights**
 
+- **L2 Hindsight Pointer Retention** — research queries archived to the L3 LLM Wiki automatically retain an episode pointer in L2 Hindsight memory (`bank: main`, tags: `wiki-ref`, `research`, `web-search`) with the query, wiki path, top domains, and key sources for fast semantic and temporal retrieval across sessions.
 - **Brave Search replaces Tavily** — uses Brave's independent 30B+ page index (`api.search.brave.com`, `X-Subscription-Token`), with native published dates via `page_age`.
 - **arXiv engine** — research papers via the free public `export.arxiv.org` Atom API, no API key required. Auto-enabled for research-oriented queries; `--arxiv` / `--no-arxiv` flags or `ARXIV_ALWAYS=1` env override.
 - **RRF scoring** — Reciprocal Rank Fusion (k=60, Cormack et al. 2009), the same fusion method shipped by Elasticsearch, OpenSearch, and MongoDB for hybrid search. Tuning-free and uses each engine's full rank list.
@@ -64,16 +66,17 @@ python3 scripts/search.py "retrieval augmented generation survey" 10   # arXiv a
 python3 scripts/search.py "best pizza in rome" 5                       # arXiv excluded
 ```
 
-## Research Archiving (LLM Wiki)
+## Research Archiving & Memory Architecture (L3 LLM Wiki + L2 Hindsight)
 
-Queries containing **"research"** or **"deep research"** (case-insensitive, word-boundary matched) are automatically archived to a [Karpathy-style LLM Wiki](https://gist.github.com/karpathy/442a6bf555914893e9891c11519de94f) — normal searches are never archived.
+Queries containing **"research"** or **"deep research"** (case-insensitive, word-boundary matched) are automatically archived to a [Karpathy-style LLM Wiki](https://gist.github.com/karpathy/442a6bf555914893e9891c11519de94f) (L3) and indexed via pointer in **Hindsight Memory** (L2) — normal searches are never archived.
 
-- **Location:** `WIKI_PATH` env var (default `~/wiki`)
-- **What's written:** a page under `queries/` with YAML frontmatter (title, dates, type, tags, source URLs) and all ranked results with scores/engine agreement; plus an `index.md` entry and a `log.md` append
+- **L3 LLM Wiki Location:** `WIKI_PATH` env var (default `~/wiki`)
+- **What's written to L3:** a page under `queries/` with YAML frontmatter (title, dates, type, tags, source URLs) and all ranked results with scores/engine agreement; plus an `index.md` entry and a `log.md` append
+- **L2 Hindsight Pointer:** an episode memory is retained via Hindsight API (`HINDSIGHT_API_URL`, default `http://localhost:8888`, `bank: main`, tags: `wiki-ref`, `research`, `web-search`) storing the query, wiki relative path, and top source URLs. This allows semantic and temporal queries over historical research without bloating memory with full documents.
 - **No clobbering:** repeat runs of the same query create `slug-2.md`, `slug-3.md`, …
-- **Best-effort:** wiki write failures print a warning to stderr and never break search output
+- **Best-effort:** wiki write and Hindsight retain failures print a warning to stderr and never break search output
 - **JSON mode:** adds an `archived_to_wiki` field (file path or `null`)
-- **Overrides:** `--wiki` forces archiving, `--no-wiki` disables it
+- **Overrides:** `--wiki` forces archiving, `--no-wiki` disables it; `HINDSIGHT_AUTO_RETAIN=0` disables Hindsight pointer retention.
 
 ```bash
 # Archived (contains "research")
@@ -181,6 +184,7 @@ URLs are normalized (lowercase netloc, trailing slash stripped, query/fragment i
 
 ## Changelog
 
+- **v2.4.0** (2026-08-27) — L2 Hindsight pointer retention for L3 LLM Wiki research query archives (stores `wiki-ref` episode in Hindsight memory for semantic/temporal discovery).
 - **v2.3.0** (2026-08-27) — Brave Search replaces Tavily as engine #3 (independent index, X-Subscription-Token auth, page_age dates); synthesized-answer feature removed from JSON output.
 - **v2.2.0** — arXiv engine (4th, auto-enabled for research queries), RRF scoring, engine key-guard.
 - **v2.1.0** — LLM Wiki auto-archiving for research queries.
