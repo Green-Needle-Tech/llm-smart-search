@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Multi-engine web search: Firecrawl + Exa + Tavily + arXiv in parallel. v2.2.0
+"""Multi-engine web search: Firecrawl + Exa + Brave + arXiv in parallel. v2.3.0
 
 Usage:
   python3 search.py "query" [max_results] [--json]
@@ -12,6 +12,10 @@ Research archiving:
   log.md append. Normal searches are NOT archived. Override with
   --no-wiki (never archive) or --wiki (always archive).
 
+v2.3.0 changes over v2.2:
+  - Tavily replaced by Brave Search API (api.search.brave.com, X-Subscription-Token)
+    as the third web engine; Brave returns published dates via page_age
+  - Engine key-guard now checks BRAVE_SEARCH_API_KEY instead of TAVILY_API_KEY
 v2.2.0 improvements over v2.1:
   - arXiv engine (4th): research papers via export.arxiv.org API, auto-enabled for
     research-y queries or --arxiv; keyword queries of <=4 words also get arXiv
@@ -22,7 +26,6 @@ v2.2.0 improvements over v2.1:
   - Engine registry: ENGINES dict makes adding engines a 10-line change
 
 v2.0.0 improvements over v1:
-  - Tavily: uses `include_answer` for a synthesized answer + returns published dates
   - Exa: uses neural/keyword auto mode + returns published dates
   - Firecrawl: passes lang filter, tolerates both list and {web:[]} payloads
   - Better scoring: engine agreement + domain quality + recency bonus + position decay
@@ -50,7 +53,7 @@ def load_env():
     def has_search_keys(path):
         try:
             with open(path) as f:
-                return any(l.startswith(("EXA_API_KEY=", "TAVILY_API_KEY=", "FIRECRAWL_API_KEY="))
+                return any(l.startswith(("EXA_API_KEY=", "BRAVE_SEARCH_API_KEY=", "FIRECRAWL_API_KEY="))
                            for l in f)
         except OSError:
             return False
@@ -207,24 +210,42 @@ def search_exa(q, limit):
         return results
     return _with_retry(run)
 
-# --- Engine 3: Tavily (+ synthesized answer) ---
-def search_tavily(q, limit):
+# --- Engine 3: Brave Search (web index, X-Subscription-Token auth) ---
+def search_brave(q, limit):
     def run():
-        resp = _post("https://api.tavily.com/search",
-                     {"query": q, "max_results": limit,
-                      "include_answer": True,
-                      "api_key": os.environ["TAVILY_API_KEY"]}) if os.environ.get("TAVILY_API_KEY") else (_ for _ in ()).throw(RuntimeError("TAVILY_API_KEY not set (add it to ~/.hermes/.env)"))
+        if not os.environ.get("BRAVE_SEARCH_API_KEY"):
+            raise RuntimeError("BRAVE_SEARCH_API_KEY not set (add it to ~/.hermes/.env)")
+        from urllib.parse import urlencode
+        url = ("https://api.search.brave.com/res/v1/web/search?"
+               + urlencode({"q": q, "count": min(limit, 20), "country": "us",
+                            "search_lang": "en", "safesearch": "moderate",
+                            "extra_snippets": "false"}))
+        req = urllib.request.Request(url, headers={
+            "Accept": "application/json",
+            "Accept-Encoding": "gzip",
+            "X-Subscription-Token": os.environ["BRAVE_SEARCH_API_KEY"],
+        })
+        import gzip as _gzip
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            raw = resp.read()
+            if resp.headers.get("Content-Encoding") == "gzip":
+                raw = _gzip.decompress(raw)
+        data = json.loads(raw)
         results = []
-        for i, r in enumerate(resp.get("results", [])):
+        for i, r in enumerate((data.get("web") or {}).get("results", [])):
+            # page_age is ISO datetime; age is human-readable ("2 days ago")
+            date = r.get("page_age") or ""
+            if not date and r.get("age", "").startswith("20"):  # some ages are dates
+                date = r["age"]
             results.append({
                 "url": r.get("url", ""),
                 "title": r.get("title", "") or r.get("url", ""),
-                "snippet": (r.get("content") or r.get("snippet") or "")[:300],
-                "engine": "tavily",
+                "snippet": (r.get("description") or "")[:300],
+                "engine": "brave",
                 "rank": i,
-                "date": r.get("published_date") or "",
+                "date": date,
             })
-        return results, resp.get("answer") or ""
+        return results
     return _with_retry(run)
 
 
@@ -277,25 +298,19 @@ USE_ARXIV = (ARXIV_FLAG == "on"
 ENGINES = [
     ("firecrawl", lambda: search_firecrawl(QUERY, MAX_RESULTS)),
     ("exa", lambda: search_exa(QUERY, MAX_RESULTS)),
-    ("tavily", lambda: search_tavily(QUERY, MAX_RESULTS)),
+    ("brave", lambda: search_brave(QUERY, MAX_RESULTS)),
 ]
 if USE_ARXIV:
     ENGINES.append(("arxiv", lambda: search_arxiv(QUERY, MAX_RESULTS)))
 
 # --- Run engines in parallel ---
 all_results, errors = [], []
-tavily_answer = ""
 with ThreadPoolExecutor(max_workers=len(ENGINES)) as pool:
     futures = {pool.submit(fn): name for name, fn in ENGINES}
     for fut in as_completed(futures):
         engine = futures[fut]
         try:
-            out = fut.result()
-            if engine == "tavily":
-                results, tavily_answer = out
-                all_results.extend(results)
-            else:
-                all_results.extend(out)
+            all_results.extend(fut.result())
         except Exception as e:
             errors.append(f"{engine}: {e}")
 
@@ -415,7 +430,7 @@ def archive_to_wiki(query, results, answer, engine_errors):
             f"# Research: {query}",
             "",
             f"*Auto-archived by llm-smart-search on {today} "
-            f"(firecrawl + exa + tavily, {len(results)} ranked results).*",
+            f"(firecrawl + exa + brave, {len(results)} ranked results).*",
             "",
         ]
         if answer:
@@ -461,14 +476,13 @@ def archive_to_wiki(query, results, answer, engine_errors):
         print(f"wiki-archive: skipped ({e})", file=sys.stderr)
         return None
 
-wiki_path = archive_to_wiki(QUERY, ranked, tavily_answer, errors) if ARCHIVE_TO_WIKI else None
+wiki_path = archive_to_wiki(QUERY, ranked, "", errors) if ARCHIVE_TO_WIKI else None
 
 # --- Output ---
 if JSON_OUT:
     print(json.dumps({
         "query": QUERY,
         "engines": active_engines,
-        "answer": tavily_answer,
         "raw": len(all_results),
         "deduped": len(merged),
         "errors": errors,
@@ -484,9 +498,6 @@ if ARCHIVE_TO_WIKI:
     print(f"Wiki: {'archived -> ' + wiki_path if wiki_path else 'archive skipped (no results or error)'}")
 if errors:
     print(f"Errors: {', '.join(errors)}")
-if tavily_answer:
-    print("=" * 80)
-    print(f"Synthesized answer (Tavily): {tavily_answer[:500]}")
 print("=" * 80)
 for i, r in enumerate(ranked, 1):
     print(f"\n[{i}] {r['title']}")

@@ -1,6 +1,6 @@
 # LLM Smart Search
 
-Multi-engine web search for AI agents and RAG pipelines — **Firecrawl + Exa + Tavily + arXiv in parallel, fused via Reciprocal Rank Fusion (RRF), scored, and ranked**, with a synthesized one-line answer on top.
+Multi-engine web search for AI agents and RAG pipelines — **Firecrawl + Exa + Brave + arXiv in parallel, fused via Reciprocal Rank Fusion (RRF), scored, and ranked**.
 
 One Python script. Zero pip dependencies (stdlib only, Python 3.8+). Built to run inside [Hermes Agent](https://hermes-agent.nousresearch.com) sessions, cron jobs, or any pipeline where a single search engine misses too much.
 
@@ -16,16 +16,16 @@ flowchart LR
     subgraph P ["ThreadPoolExecutor (retry ×2, key-guard)"]
         FC["Firecrawl<br/>(self-hosted or cloud)"]
         EX["Exa<br/>(neural + keyword, type=auto)"]
-        TV["Tavily<br/>(LLM-tuned, +synthesized answer)"]
+        BR["Brave<br/>(independent index, page_age dates)"]
         AX2["arXiv<br/>(optional 4th engine)"]
     end
     Q --> FC
     Q --> EX
-    Q --> TV
+    Q --> BR
     AX -.-> AX2
     FC --> DD["Dedupe<br/>URL normalization + docs-alias collapsing"]
     EX --> DD
-    TV --> DD
+    BR --> DD
     AX2 --> DD
     DD --> RRF["RRF Score<br/>Σ 1/(60+rank) × 100<br/>+ domain + recency"]
     RRF --> RK[Rank]
@@ -33,10 +33,11 @@ flowchart LR
     RK -. "research query? (wiki trigger)" .-> WK[("LLM Wiki<br/>queries/ archive")]
 ```
 
-**v2.2.0 highlights**
+**v2.3.0 highlights**
 
+- **Brave Search replaces Tavily** — uses Brave's independent 30B+ page index (`api.search.brave.com`, `X-Subscription-Token`), with native published dates via `page_age`.
 - **arXiv engine** — research papers via the free public `export.arxiv.org` Atom API, no API key required. Auto-enabled for research-oriented queries; `--arxiv` / `--no-arxiv` flags or `ARXIV_ALWAYS=1` env override.
-- **RRF scoring** — replaces hand-tuned engine-agreement weights with Reciprocal Rank Fusion (k=60, Cormack et al. 2009), the same fusion method shipped by Elasticsearch, OpenSearch, and MongoDB for hybrid search. Tuning-free and uses each engine's full rank list.
+- **RRF scoring** — Reciprocal Rank Fusion (k=60, Cormack et al. 2009), the same fusion method shipped by Elasticsearch, OpenSearch, and MongoDB for hybrid search. Tuning-free and uses each engine's full rank list.
 - **Engine registry** — engines live in an `ENGINES` list; adding a new one is a one-liner.
 - **Reliability** — clear "key not set" errors instead of raw `KeyError`; stderr warning when fewer than 2 engines return results; friendly usage error (exit code 2) on invalid `MAX_RESULTS`.
 
@@ -68,7 +69,7 @@ python3 scripts/search.py "best pizza in rome" 5                       # arXiv e
 Queries containing **"research"** or **"deep research"** (case-insensitive, word-boundary matched) are automatically archived to a [Karpathy-style LLM Wiki](https://gist.github.com/karpathy/442a6bf555914893e9891c11519de94f) — normal searches are never archived.
 
 - **Location:** `WIKI_PATH` env var (default `~/wiki`)
-- **What's written:** a page under `queries/` with YAML frontmatter (title, dates, type, tags, source URLs), the synthesized answer, and all ranked results with scores/engine agreement; plus an `index.md` entry and a `log.md` append
+- **What's written:** a page under `queries/` with YAML frontmatter (title, dates, type, tags, source URLs) and all ranked results with scores/engine agreement; plus an `index.md` entry and a `log.md` append
 - **No clobbering:** repeat runs of the same query create `slug-2.md`, `slug-3.md`, …
 - **Best-effort:** wiki write failures print a warning to stderr and never break search output
 - **JSON mode:** adds an `archived_to_wiki` field (file path or `null`)
@@ -95,12 +96,12 @@ Set these in your environment or `~/.hermes/.env` (the script's built-in env loa
 | `FIRECRAWL_API_KEY` | Firecrawl key |
 | `FIRECRAWL_API_URL` | Optional — defaults to `https://api.firecrawl.dev`; point at a self-hosted instance if you have one |
 | `EXA_API_KEY` | api.exa.ai |
-| `TAVILY_API_KEY` | api.tavily.com |
+| `BRAVE_SEARCH_API_KEY` | api.search.brave.com (X-Subscription-Token) |
 | `ARXIV_ALWAYS` | Optional — set to `1` to always include the arXiv engine (no key needed) |
 
 Engines whose key is missing are skipped with a clear error message in `errors` instead of crashing.
 
-## Scoring Model (v2.2 — Reciprocal Rank Fusion)
+## Scoring Model (Reciprocal Rank Fusion)
 
 Results are fused with **RRF** (Cormack et al., 2009) — the same method shipped by Elasticsearch, OpenSearch, and MongoDB for hybrid search:
 
@@ -129,22 +130,34 @@ URLs are normalized (lowercase netloc, trailing slash stripped, query/fragment i
 
 ```json
 {
-  "query": "...",
-  "engines": ["firecrawl", "exa", "tavily", "arxiv"],
-  "answer": "Tavily synthesized one-line answer",
-  "raw": 24, "deduped": 18,
+  "query": "machine learning",
+  "engines": ["firecrawl", "exa", "brave"],
+  "raw": 6,
+  "deduped": 4,
   "errors": [],
   "archived_to_wiki": null,
   "results": [
-    {"url": "...", "title": "...", "snippet": "...",
-     "engine": "exa", "rank": 0, "date": "2026-03-17",
-     "engines": ["exa", "tavily"], "best_rank": 0,
-     "engine_ranks": {"exa": 0, "tavily": 2}, "score": 3.55}
+    {
+      "url": "https://en.wikipedia.org/wiki/Machine_learning",
+      "title": "Machine learning - Wikipedia",
+      "snippet": "...",
+      "engine": "brave",
+      "rank": 0,
+      "date": "2026-08-17T05:38:37",
+      "engines": ["brave", "exa", "firecrawl"],
+      "engine_ranks": {
+        "brave": 0,
+        "exa": 0,
+        "firecrawl": 1
+      },
+      "best_rank": 0,
+      "score": 5.192
+    }
   ]
 }
 ```
 
-`engine_ranks` (new in v2.2) records each engine's own ranking of the result — the input to RRF.
+`engine_ranks` records each engine's own ranking of the result — the input to RRF.
 
 ## Exit Codes
 
@@ -157,14 +170,21 @@ URLs are normalized (lowercase netloc, trailing slash stripped, query/fragment i
 
 - [`docs/MULTI_ENGINE_SEARCH_v2.md`](docs/MULTI_ENGINE_SEARCH_v2.md) — full skill documentation (architecture, scoring, dedup rules, A/B test results)
 - [`docs/MULTI_ENGINE_SEARCH_v2_INSTALL.md`](docs/MULTI_ENGINE_SEARCH_v2_INSTALL.md) — single-file installable package (docs + complete source)
-- [Release v2.2.0](https://github.com/david6055my/llm-smart-search/releases/tag/v2.2.0) — arXiv engine + RRF scoring changelog
+- [Release v2.3.0](https://github.com/Green-Needle-Tech/llm-smart-search/releases/tag/v2.3.0) — Brave Search API engine changelog
 
 ## Install as a Hermes Agent skill
 
 1. `mkdir -p ~/.hermes/skills/research/llm-smart-search/scripts`
 2. Copy `scripts/search.py` into it
-3. Add the 3–4 API keys to `~/.hermes/.env` (arXiv needs none)
+3. Add the 3 API keys to `~/.hermes/.env` (arXiv needs none)
 4. Verify: `python3 scripts/search.py "test query" 5`
+
+## Changelog
+
+- **v2.3.0** (2026-08-27) — Brave Search replaces Tavily as engine #3 (independent index, X-Subscription-Token auth, page_age dates); synthesized-answer feature removed from JSON output.
+- **v2.2.0** — arXiv engine (4th, auto-enabled for research queries), RRF scoring, engine key-guard.
+- **v2.1.0** — LLM Wiki auto-archiving for research queries.
+- **v2.0.0** — retries per engine, domain-quality scoring, --json mode.
 
 ## License
 
