@@ -14,8 +14,8 @@ flowchart LR
     G -- "yes / --arxiv" --> AX["arXiv<br/>(free Atom API, no key)"]
     G -- no --> P
     subgraph P ["ThreadPoolExecutor (retry ×2, key-guard)"]
-        FC["Firecrawl<br/>(self-hosted or cloud)"]
-        EX["Exa<br/>(neural + keyword, type=auto)"]
+        FC["Firecrawl v2<br/>(self-hosted or cloud)"]
+        EX["Exa<br/>(mode: instant/fast/auto/deep*)"]
         BR["Brave<br/>(independent index, page_age dates)"]
         AX2["arXiv<br/>(optional 4th engine)"]
     end
@@ -34,12 +34,14 @@ flowchart LR
     WK -. "pointer retain (wiki-ref)" .-> HS[("L2 Hindsight<br/>semantic & temporal index")]
 ```
 
-**v2.4.0 highlights**
+**v3.0.0 highlights** (aligned with latest Firecrawl / Exa / Brave API docs, 2026-09)
 
-- **L2 Hindsight Pointer Retention** — research queries archived to the L3 LLM Wiki automatically retain an episode pointer in L2 Hindsight memory (`bank: main`, tags: `wiki-ref`, `research`, `web-search`) with the query, wiki path, top domains, and key sources for fast semantic and temporal retrieval across sessions.
-- **Brave Search replaces Tavily** — uses Brave's independent 30B+ page index (`api.search.brave.com`, `X-Subscription-Token`), with native published dates via `page_age`.
-- **arXiv engine** — research papers via the free public `export.arxiv.org` Atom API, no API key required. Auto-enabled for research-oriented queries; `--arxiv` / `--no-arxiv` flags or `ARXIV_ALWAYS=1` env override.
-- **RRF scoring** — Reciprocal Rank Fusion (k=60, Cormack et al. 2009), the same fusion method shipped by Elasticsearch, OpenSearch, and MongoDB for hybrid search. Tuning-free and uses each engine's full rank list.
+- **Firecrawl v2 API** — migrated to `POST /v2/search` (v1 deprecated in cloud docs). v2 groups results by source type (`data.web` / `data.news`); web + news results are merged, and v1 list-style payloads from older self-hosted instances still parse. Optional `FIRECRAWL_SOURCES` env (e.g. `web,news`) maps to the v2 `sources` param.
+- **Exa search modes** — `type` is now a mode selector (`instant` / `fast` / `auto` / `deep-lite` / `deep` / `deep-reasoning`, default `auto`). Configurable via `EXA_SEARCH_TYPE`; optional `EXA_CATEGORY` (publication/news/company/…) and `EXA_USER_LOCATION` (2-letter ISO country).
+- **Brave extra snippets** — `extra_snippets=true` pulls up to 5 additional excerpts per result, merged into the snippet for better dedup and scoring. Optional `BRAVE_FRESHNESS` (pd/pw/pm/py or custom date range), `BRAVE_COUNTRY`, `BRAVE_SEARCH_LANG`.
+- **arXiv 2026 compliance** — descriptive User-Agent with contact URL (arXiv's 2026 API policy); HTTP 406 from arXiv's edge burst-quota is surfaced as a clear throttling message instead of a hard error (retrying inside the window prolongs it).
+- **L2 Hindsight Pointer Retention** — research queries archived to the L3 LLM Wiki automatically retain an episode pointer in L2 Hindsight memory (`bank: main`, tags: `wiki-ref`, `research`, `web-search`).
+- **RRF scoring** — Reciprocal Rank Fusion (k=60, Cormack et al. 2009), the same fusion method shipped by Elasticsearch, OpenSearch, and MongoDB for hybrid search.
 - **Engine registry** — engines live in an `ENGINES` list; adding a new one is a one-liner.
 - **Reliability** — clear "key not set" errors instead of raw `KeyError`; stderr warning when fewer than 2 engines return results; friendly usage error (exit code 2) on invalid `MAX_RESULTS`.
 
@@ -98,8 +100,14 @@ Set these in your environment or `~/.hermes/.env` (the script's built-in env loa
 |---|---|
 | `FIRECRAWL_API_KEY` | Firecrawl key |
 | `FIRECRAWL_API_URL` | Optional — defaults to `https://api.firecrawl.dev`; point at a self-hosted instance if you have one |
+| `FIRECRAWL_SOURCES` | Optional — comma-separated v2 source types (e.g. `web,news`); `limit` applies per source |
 | `EXA_API_KEY` | api.exa.ai |
+| `EXA_SEARCH_TYPE` | Optional — search mode: `instant` / `fast` / `auto` (default) / `deep-lite` / `deep` / `deep-reasoning` |
+| `EXA_CATEGORY` | Optional — data category focus: `publication` / `news` / `company` / `people` / … |
+| `EXA_USER_LOCATION` | Optional — 2-letter ISO country code (e.g. `US`) |
 | `BRAVE_SEARCH_API_KEY` | api.search.brave.com (X-Subscription-Token) |
+| `BRAVE_FRESHNESS` | Optional — `pd` (24h) / `pw` (7d) / `pm` (31d) / `py` (1y) or `YYYY-MM-DDtoYYYY-MM-DD` |
+| `BRAVE_COUNTRY` / `BRAVE_SEARCH_LANG` | Optional — 2-letter country code / language code (default `us` / `en`) |
 | `ARXIV_ALWAYS` | Optional — set to `1` to always include the arXiv engine (no key needed) |
 
 Engines whose key is missing are skipped with a clear error message in `errors` instead of crashing.
@@ -173,7 +181,7 @@ URLs are normalized (lowercase netloc, trailing slash stripped, query/fragment i
 
 - [`docs/MULTI_ENGINE_SEARCH_v2.md`](docs/MULTI_ENGINE_SEARCH_v2.md) — full skill documentation (architecture, scoring, dedup rules, A/B test results)
 - [`docs/MULTI_ENGINE_SEARCH_v2_INSTALL.md`](docs/MULTI_ENGINE_SEARCH_v2_INSTALL.md) — single-file installable package (docs + complete source)
-- [Release v2.3.0](https://github.com/Green-Needle-Tech/llm-smart-search/releases/tag/v2.3.0) — Brave Search API engine changelog
+- [Release v3.0.0](https://github.com/Green-Needle-Tech/llm-smart-search/releases/tag/v3.0.0) — Firecrawl v2 / Exa modes / Brave extra snippets changelog
 
 ## Install as a Hermes Agent skill
 
@@ -184,6 +192,7 @@ URLs are normalized (lowercase netloc, trailing slash stripped, query/fragment i
 
 ## Changelog
 
+- **v3.0.0** (2026-09-27) — Firecrawl v2 API migration (`/v2/search`, source-type grouping, `FIRECRAWL_SOURCES`); Exa search-mode selector (`EXA_SEARCH_TYPE`, `EXA_CATEGORY`, `EXA_USER_LOCATION`); Brave extra snippets + `BRAVE_FRESHNESS`/`BRAVE_COUNTRY`/`BRAVE_SEARCH_LANG`; arXiv 2026 UA compliance + 406 throttling surfaced clearly.
 - **v2.4.0** (2026-08-27) — L2 Hindsight pointer retention for L3 LLM Wiki research query archives (stores `wiki-ref` episode in Hindsight memory for semantic/temporal discovery).
 - **v2.3.0** (2026-08-27) — Brave Search replaces Tavily as engine #3 (independent index, X-Subscription-Token auth, page_age dates); synthesized-answer feature removed from JSON output.
 - **v2.2.0** — arXiv engine (4th, auto-enabled for research queries), RRF scoring, engine key-guard.

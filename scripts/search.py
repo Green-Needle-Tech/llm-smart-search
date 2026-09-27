@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Multi-engine web search: Firecrawl + Exa + Brave + arXiv in parallel. v2.4.0
+"""Multi-engine web search: Firecrawl + Exa + Brave + arXiv in parallel. v3.0.0
 
 Usage:
   python3 search.py "query" [max_results] [--json]
@@ -14,6 +14,18 @@ Research archiving & Memory Architecture:
   Normal searches are NOT archived. Override with
   --no-wiki (never archive) or --wiki (always archive).
 
+v3.0.0 improvements over v2.4 (aligned with latest API docs, 2026-09):
+  - Firecrawl: migrated to /v2/search (v1 deprecated in cloud docs). v2 groups
+    results by source type (data.web / data.news / data.images); v1 list-style
+    payloads still parsed as fallback for older self-hosted instances. Optional
+    FIRECRAWL_SOURCES env (e.g. "web,news") maps to the v2 `sources` param.
+  - Exa: `type` is now a search-mode selector (instant/fast/auto/deep-lite/
+    deep/deep-reasoning; default auto). Configurable via EXA_SEARCH_TYPE env.
+    Optional EXA_CATEGORY (publication/news/company/...) and EXA_USER_LOCATION
+    (2-letter ISO country) env vars.
+  - Brave: extra_snippets=true (up to 5 additional excerpts per result, merged
+    into the snippet for better dedup/scoring). Optional BRAVE_FRESHNESS env
+    (pd/pw/pm/py or custom date range) and BRAVE_COUNTRY/BRAVE_SEARCH_LANG.
 v2.4.0 improvements over v2.3:
   - L2 Hindsight pointer retention: when research queries are archived to L3 LLM Wiki,
     a pointer episode is automatically retained in Hindsight memory (bank: main,
@@ -168,38 +180,76 @@ def _with_retry(fn, retries=2, backoff=1.5):
             raise
     raise last_err
 
-# --- Engine 1: Firecrawl (self-hosted or cloud) ---
+def _raise_arxiv_406(e):
+    """arXiv's edge returns 406 (empty body, no Retry-After) as an IP-level
+    burst quota — affects ALL clients on the host for minutes at a time
+    (known issue since 2026-09; see blazickjp/arxiv-mcp-server#277). Retrying
+    inside the window keeps it open, so we surface a clear message instead."""
+    raise RuntimeError(
+        "arXiv throttling (HTTP 406): IP-level burst quota at arXiv's edge; "
+        "retry in a few minutes — results from other engines are unaffected"
+    ) from e
+
+# --- Engine 1: Firecrawl v2 (self-hosted or cloud) ---
 def search_firecrawl(q, limit):
+    """POST /v2/search — results grouped by source type under data.web/news/images.
+
+    v1 list-style payloads (older self-hosted) are still handled as fallback.
+    FIRECRAWL_SOURCES env (comma-separated, e.g. "web,news") maps to the v2
+    `sources` param; limit applies per source type.
+    """
     def run():
         fc_url = os.environ.get("FIRECRAWL_API_URL", "https://api.firecrawl.dev").rstrip("/")
         fc_key = os.environ.get("FIRECRAWL_API_KEY", "")
         headers = {"Authorization": f"Bearer {fc_key}"} if fc_key else {}
-        resp = _post(f"{fc_url}/v1/search", {"query": q, "limit": limit}, headers)
-        web = resp.get("data", [])
-        if isinstance(web, dict):
-            web = web.get("web", [])
+        payload = {"query": q, "limit": limit}
+        sources = [s.strip() for s in os.environ.get("FIRECRAWL_SOURCES", "").split(",") if s.strip()]
+        if sources:
+            payload["sources"] = sources
+        resp = _post(f"{fc_url}/v2/search", payload, headers)
+        data = resp.get("data", [])
+        if isinstance(data, dict):
+            web = list(data.get("web") or [])
+            news = list(data.get("news") or [])
+            for r in news:
+                r.setdefault("description", r.get("snippet") or "")
+            web = web + news
+        elif isinstance(data, list):  # v1 fallback
+            web = data
+        else:
+            web = []
         results = []
         for i, r in enumerate(web):
             desc = r.get("description") or r.get("snippet") or ""
+            # news results carry "date" ("3 months ago"); web carry no date
+            date = r.get("date") or r.get("publishedDate") or ""
             results.append({
                 "url": r.get("url", ""),
                 "title": r.get("title", "") or r.get("url", ""),
                 "snippet": desc[:300],
                 "engine": "firecrawl",
                 "rank": i,
-                "date": r.get("publishedDate") or "",
+                "date": date,
             })
         return results
     return _with_retry(run)
 
-# --- Engine 2: Exa (auto: neural + keyword) ---
+# --- Engine 2: Exa (search modes: instant/fast/auto/deep-lite/deep/deep-reasoning) ---
+EXA_SEARCH_TYPES = {"instant", "fast", "auto", "deep-lite", "deep", "deep-reasoning"}
 def search_exa(q, limit):
     def run():
-        resp = _post("https://api.exa.ai/search",
-                     {"query": q, "numResults": limit,
-                      "type": "auto",
-                      "contents": {"highlights": True}},
-                     {"x-api-key": os.environ["EXA_API_KEY"]}) if os.environ.get("EXA_API_KEY") else (_ for _ in ()).throw(RuntimeError("EXA_API_KEY not set (add it to ~/.hermes/.env)"))
+        if not os.environ.get("EXA_API_KEY"):
+            raise RuntimeError("EXA_API_KEY not set (add it to ~/.hermes/.env)")
+        payload = {"query": q, "numResults": limit,
+                   "type": os.environ.get("EXA_SEARCH_TYPE", "auto"),
+                   "contents": {"highlights": True}}
+        category = os.environ.get("EXA_CATEGORY", "").strip()
+        if category:
+            payload["category"] = category
+        user_location = os.environ.get("EXA_USER_LOCATION", "").strip()
+        if user_location:
+            payload["userLocation"] = user_location
+        resp = _post("https://api.exa.ai/search", payload, {"x-api-key": os.environ["EXA_API_KEY"]})
         results = []
         for i, r in enumerate(resp.get("results", [])):
             highlights = r.get("highlights", [])
@@ -221,10 +271,15 @@ def search_brave(q, limit):
         if not os.environ.get("BRAVE_SEARCH_API_KEY"):
             raise RuntimeError("BRAVE_SEARCH_API_KEY not set (add it to ~/.hermes/.env)")
         from urllib.parse import urlencode
-        url = ("https://api.search.brave.com/res/v1/web/search?"
-               + urlencode({"q": q, "count": min(limit, 20), "country": "us",
-                            "search_lang": "en", "safesearch": "moderate",
-                            "extra_snippets": "false"}))
+        params = {"q": q, "count": min(limit, 20),
+                  "country": os.environ.get("BRAVE_COUNTRY", "us"),
+                  "search_lang": os.environ.get("BRAVE_SEARCH_LANG", "en"),
+                  "safesearch": "moderate",
+                  "extra_snippets": "true"}  # up to 5 extra excerpts per result
+        freshness = os.environ.get("BRAVE_FRESHNESS", "").strip()
+        if freshness:  # pd/pw/pm/py or "YYYY-MM-DDtoYYYY-MM-DD"
+            params["freshness"] = freshness
+        url = "https://api.search.brave.com/res/v1/web/search?" + urlencode(params)
         req = urllib.request.Request(url, headers={
             "Accept": "application/json",
             "Accept-Encoding": "gzip",
@@ -242,10 +297,15 @@ def search_brave(q, limit):
             date = r.get("page_age") or ""
             if not date and r.get("age", "").startswith("20"):  # some ages are dates
                 date = r["age"]
+            # merge extra snippets into the main snippet for richer dedup/scoring
+            snippet = r.get("description") or ""
+            extras = [s for s in (r.get("extra_snippets") or []) if s]
+            if extras:
+                snippet = (snippet + " | " + " | ".join(extras)).strip()
             results.append({
                 "url": r.get("url", ""),
                 "title": r.get("title", "") or r.get("url", ""),
-                "snippet": (r.get("description") or "")[:300],
+                "snippet": snippet[:300],
                 "engine": "brave",
                 "rank": i,
                 "date": date,
@@ -267,9 +327,19 @@ def search_arxiv(q, limit):
         url = ("https://export.arxiv.org/api/query?search_query=all:"
                + _uparse.quote(q) + "&start=0&max_results=" + str(min(limit, 20))
                + "&sortBy=relevance&sortOrder=descending")
-        req = urllib.request.Request(url, headers={"User-Agent": "llm-smart-search/2.2"})
-        with urllib.request.urlopen(req, timeout=30) as resp:
-            xml = resp.read().decode("utf-8", "replace")
+        # arXiv requires a descriptive UA with contact info since 2026 —
+        # generic/bot UAs get 406 Not Acceptable.
+        req = urllib.request.Request(url, headers={
+            "User-Agent": "llm-smart-search/3.0 (github.com/Green-Needle-Tech/llm-smart-search)",
+            "Accept": "application/atom+xml",
+        })
+        try:
+            with urllib.request.urlopen(req, timeout=30) as resp:
+                xml = resp.read().decode("utf-8", "replace")
+        except urllib.error.HTTPError as exc:
+            if exc.code == 406:
+                _raise_arxiv_406(exc)  # do NOT retry — retrying keeps the window open
+            raise
         results = []
         entries = _re.findall(r"<entry>(.*?)</entry>", xml, _re.S)
         for i, e in enumerate(entries):
@@ -452,7 +522,7 @@ def archive_to_wiki(query, results, answer, engine_errors):
     try:
         import datetime, hashlib
         wiki = os.environ.get("WIKI_PATH", os.path.expanduser("~/wiki"))
-        qdir = os.path.join(wiki, "queries")
+        qdir = os.path.join(wiki, "wiki", "queries")  # karpathy: wiki/<topic>/
         os.makedirs(qdir, exist_ok=True)
         today = datetime.date.today().isoformat()
         slug = slugify(query)
@@ -462,17 +532,12 @@ def archive_to_wiki(query, results, answer, engine_errors):
             n += 1
             path = os.path.join(qdir, f"{slug}-{n}.md")
         sources = [r["url"] for r in results if r.get("url")]
+        src_line = "; ".join(f"[{s}]({s})" for s in sources[:10])
         lines = [
-            "---",
-            f"title: 'Research: {query[:100]}'",
-            f"created: {today}",
-            f"updated: {today}",
-            "type: query",
-            "tags: [research, web-search]",
-            f"sources: {json.dumps(sources[:10])}",
-            "---",
-            "",
             f"# Research: {query}",
+            "",
+            f"> Sources: {src_line}",
+            f"> Archived: {today}",
             "",
             f"*Auto-archived by llm-smart-search on {today} "
             f"(firecrawl + exa + brave, {len(results)} ranked results).*",
@@ -491,34 +556,34 @@ def archive_to_wiki(query, results, answer, engine_errors):
             lines += ["", f"*Engine errors: {'; '.join(engine_errors)}*"]
         with open(path, "w", encoding="utf-8") as f:
             f.write("\n".join(lines) + "\n")
-        # index.md entry (append under ## Queries, or create header)
-        idx = os.path.join(wiki, "index.md")
-        entry = f"- [[{os.path.splitext(os.path.basename(path))[0]}]] — {query[:80]}"
+        # index.md entry (karpathy table format under ## queries)
+        idx = os.path.join(wiki, "wiki", "index.md")
+        entry_slug = os.path.splitext(os.path.basename(path))[0]
+        entry = f"| [{query[:80]}](queries/{entry_slug}.md) | [Archived] Auto-archived research | {today} |"
         if os.path.exists(idx):
             with open(idx, encoding="utf-8") as f:
                 content = f.read()
-            if "## Queries" in content:
-                head, _, tail = content.rpartition("## Queries")
+            if "## queries" in content:
+                head, _, tail = content.rpartition("## queries")
                 # insert before next section header or at end
                 nxt = _re.search(r"\n## ", tail)
                 insert_at = nxt.start() if nxt else len(tail)
                 tail = tail[:insert_at].rstrip("\n") + "\n" + entry + "\n" + tail[insert_at:]
-                content = head + "## Queries" + tail
+                content = head + "## queries" + tail
             else:
-                content = content.rstrip("\n") + "\n\n## Queries\n\n" + entry + "\n"
+                content = content.rstrip("\n") + "\n\n## queries\n\nArchived research answers (point-in-time snapshots).\n\n| Article | Summary | Updated |\n|---------|---------|---------|\n" + entry + "\n"
             with open(idx, "w", encoding="utf-8") as f:
                 f.write(content)
         else:
             with open(idx, "w", encoding="utf-8") as f:
-                f.write(f"# Wiki Index\n\n## Queries\n\n{entry}\n")
-        # log.md append
-        log = os.path.join(wiki, "log.md")
+                f.write(f"# Knowledge Base Index\n\n## queries\n\nArchived research answers (point-in-time snapshots).\n\n| Article | Summary | Updated |\n|---------|---------|---------|\n{entry}\n")
+        # log.md append (karpathy format)
+        log = os.path.join(wiki, "wiki", "log.md")
         with open(log, "a", encoding="utf-8") as f:
-            f.write(f"\n## [{today}] ingest | llm-smart-search: {query[:80]}\n"
-                    f"- Archived {len(results)} ranked results to queries/{os.path.basename(path)}\n")
+            f.write(f"\n## [{today}] query | Archived: {query[:80]}\n")
 
         # Retain L2 pointer in Hindsight
-        rel_wiki_path = f"queries/{os.path.basename(path)}"
+        rel_wiki_path = f"wiki/queries/{os.path.basename(path)}"
         retain_to_hindsight(query, rel_wiki_path, results, today)
 
         return path
